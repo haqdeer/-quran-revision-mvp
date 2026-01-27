@@ -1,470 +1,303 @@
-# app.py
-# Step 10.5 — Token repair + training log + reliable copy + safe resample (simple + future-ready)
-
-import os
 import re
-import json
 import time
-import math
-import datetime
-from difflib import SequenceMatcher
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
+import gradio as gr
 import torch
 import torchaudio
-import gradio as gr
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 
 # -----------------------------
-# Config
+# CONFIG
 # -----------------------------
-MODEL_ID = os.getenv("ASR_MODEL_ID", "elgeish/wav2vec2-large-xlsr-53-arabic")
+MODEL_ID = "elgeish/wav2vec2-large-xlsr-53-arabic"
 TARGET_SR = 16000
-LOG_PATH = "training_log.jsonl"
 
-# Similarity thresholds (MVP)
-SIM_OK = 0.55          # if >= this, we treat as acceptable match
-SIM_STRICT = 0.72      # used for "confident" in UI text
-
-# Tokens shorter than this are often ASR fragments; we will try to REPAIR them instead of trusting them.
-MIN_TOKEN_LEN = 4
-
-# For silence/stuck detection
-SILENCE_DB_THRESHOLD = -38.0  # approx
-STUCK_TAIL_SECONDS = 1.2      # you paused ~1.3–4.8s many times; so keep it modest
+# "Silent listener" tuning
+MIN_TOKEN_LEN = 3              # ignore tokens shorter than this (e.g., "al", "r")
+OK_SIM_THRESHOLD = 0.62        # similarity needed to treat a token as "good enough"
+LOWCONF_THRESHOLD = 0.45       # below this = low confidence
+TWO_STRIKE = 2                 # only warn after same issue repeats
+MAX_OUTPUT_LINES = 40          # keep UI clean
 
 # -----------------------------
-# Quran (MVP: Surah Al-Fatiha only)
-# You can extend later without changing core logic.
+# Quran test set (for now)
+# Extend later using dataset, but MVP = fixed
 # -----------------------------
 QURAN = {
-    (1, 1): "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
-    (1, 2): "الْحَمْدُ لِلَّهِ رَبِّ الْعَالَمِينَ",
-    (1, 3): "الرَّحْمَٰنِ الرَّحِيمِ",
-    (1, 4): "مَالِكِ يَوْمِ الدِّينِ",
-    (1, 5): "إِيَّاكَ نَعْبُدُ وَإِيَّاكَ نَسْتَعِينُ",
-    (1, 6): "اهْدِنَا الصِّرَاطَ الْمُسْتَقِيمَ",
-    (1, 7): "صِرَاطَ الَّذِينَ أَنْعَمْتَ عَلَيْهِمْ غَيْرِ الْمَغْضُوبِ عَلَيْهِمْ وَلَا الضَّالِّينَ",
+    "1:1": "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
+    "1:2": "الْحَمْدُ لِلَّهِ رَبِّ الْعَالَمِينَ",
+    "1:3": "الرَّحْمَٰنِ الرَّحِيمِ",
+    "1:7": "صِرَاطَ الَّذِينَ أَنْعَمْتَ عَلَيْهِمْ غَيْرِ الْمَغْضُوبِ عَلَيْهِمْ وَلَا الضَّالِّينَ",
 }
 
-def list_ayat():
-    items = []
-    for (s, a) in sorted(QURAN.keys()):
-        items.append(f"{s}:{a} — {QURAN[(s,a)]}")
-    return items
-
-def parse_choice(choice: str):
-    # "1:2 — ...."
-    m = re.match(r"^\s*(\d+)\s*:\s*(\d+)", choice)
-    if not m:
-        return (1, 1)
-    return (int(m.group(1)), int(m.group(2)))
-
 # -----------------------------
-# Text helpers
+# Helpers: Arabic normalization
 # -----------------------------
 AR_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
+AR_PUNCT = re.compile(r"[^\u0600-\u06FF\s]")
 
-def strip_diacritics(ar: str) -> str:
-    ar = AR_DIACRITICS.sub("", ar)
-    # normalize common letters
-    ar = ar.replace("أ","ا").replace("إ","ا").replace("آ","ا")
-    ar = ar.replace("ى","ي").replace("ؤ","و").replace("ئ","ي")
-    ar = ar.replace("ة","ه")
-    ar = re.sub(r"\s+", " ", ar).strip()
-    return ar
+def strip_diacritics(s: str) -> str:
+    return AR_DIACRITICS.sub("", s)
 
-def arabic_words_no_diacritics(ar_with_harakat: str):
-    s = strip_diacritics(ar_with_harakat)
-    # keep Arabic letters only + spaces
-    s = re.sub(r"[^\u0600-\u06FF\s]", " ", s)
-    words = [w for w in s.split() if w]
-    return words
-
-# Arabic -> simple Latin proxy
-# IMPORTANT: we do NOT use str.maketrans (it crashes on multi-length keys).
-def ar_to_proxy(ar: str) -> str:
-    ar = strip_diacritics(ar)
-    # remove tatweel
-    ar = ar.replace("ـ", "")
-    # very light mapping
-    m = {
-        "ا":"a","ب":"b","ت":"t","ث":"th","ج":"j","ح":"h","خ":"kh",
-        "د":"d","ذ":"dh","ر":"r","ز":"z","س":"s","ش":"sh","ص":"s",
-        "ض":"d","ط":"t","ظ":"z","ع":"a","غ":"gh","ف":"f","ق":"q",
-        "ك":"k","ل":"l","م":"m","ن":"n","ه":"h","و":"w","ي":"y",
-        "ء":"", " " : " ",
-        "ة":"h",
-    }
-    out = []
-    for ch in ar:
-        out.append(m.get(ch, ""))
-    s = "".join(out)
+def normalize_ar(s: str) -> str:
+    s = strip_diacritics(s)
+    s = AR_PUNCT.sub(" ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # compress doubles
-    s = re.sub(r"(.)\1+", r"\1", s)
     return s
 
-def normalize_asr_text(t: str) -> str:
-    t = t.lower()
-    # remove weird punctuation
-    t = re.sub(r"[^a-z\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+def arabic_words(s: str) -> List[str]:
+    s = normalize_ar(s)
+    return [w for w in s.split(" ") if w]
 
-def tokenize_asr(raw: str):
-    raw_n = normalize_asr_text(raw)
-    toks = [t for t in raw_n.split() if t]
-    return toks
+# -----------------------------
+# Proxy: convert Arabic word -> simple latin-ish skeleton
+# NOTE: We do NOT use str.translate with multi-char keys (your earlier crash).
+# We keep it simple and safe.
+# -----------------------------
+AR2LAT_SINGLE = {
+    "ا":"a","أ":"a","إ":"i","آ":"a","ء":"", "ؤ":"w","ئ":"y",
+    "ب":"b","ت":"t","ث":"th","ج":"j","ح":"h","خ":"kh",
+    "د":"d","ذ":"dh","ر":"r","ز":"z","س":"s","ش":"sh",
+    "ص":"s","ض":"d","ط":"t","ظ":"z","ع":"a","غ":"gh",
+    "ف":"f","ق":"q","ك":"k","ل":"l","م":"m","ن":"n",
+    "ه":"h","و":"w","ي":"y","ى":"a","ة":"h",
+    " ":" ",
+    "َ":"", "ُ":"", "ِ":"", "ْ":"", "ّ":"", "ٰ":""
+}
+
+def ar_to_proxy(word: str) -> str:
+    word = strip_diacritics(word)
+    out = []
+    for ch in word:
+        out.append(AR2LAT_SINGLE.get(ch, ""))
+    proxy = "".join(out)
+    proxy = proxy.lower()
+    proxy = re.sub(r"[^a-z]+", "", proxy)
+    # remove common leading article "al" noise impact a bit
+    proxy = re.sub(r"^al+", "al", proxy)
+    return proxy
+
+# -----------------------------
+# Similarity (simple + fast)
+# -----------------------------
+def bigrams(s: str) -> set:
+    if len(s) < 2:
+        return set()
+    return {s[i:i+2] for i in range(len(s)-1)}
 
 def sim(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
-    return SequenceMatcher(None, a, b).ratio()
+    A, B = bigrams(a), bigrams(b)
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
 
 # -----------------------------
-# Audio helpers
+# Audio processing
 # -----------------------------
-def to_float32_wave(y: np.ndarray) -> np.ndarray:
-    # y can be int16 from mic
+def to_float32_audio(y: np.ndarray) -> np.ndarray:
+    # Gradio often returns int16 from mic
     if y is None:
-        return None
+        return y
     if y.dtype == np.int16:
         y = y.astype(np.float32) / 32768.0
-    elif y.dtype == np.int32:
-        y = y.astype(np.float32) / 2147483648.0
-    else:
+    elif y.dtype != np.float32:
         y = y.astype(np.float32)
-    # if stereo -> mono
-    if y.ndim == 2 and y.shape[1] > 1:
-        y = y.mean(axis=1)
+    # mono
+    if y.ndim == 2:
+        y = np.mean(y, axis=1).astype(np.float32)
     return y
 
-def resample_to_target(y: np.ndarray, sr: int) -> np.ndarray:
-    y = to_float32_wave(y)
-    if y is None:
-        return None
+def resample_audio(y: np.ndarray, sr: int) -> np.ndarray:
     if sr == TARGET_SR:
         return y
-    wav = torch.tensor(y, dtype=torch.float32)
-    out = torchaudio.functional.resample(wav, sr, TARGET_SR)
-    return out.numpy()
-
-def tail_silence_seconds(y: np.ndarray, sr: int) -> float:
-    # rough dB threshold on amplitude
-    if y is None or len(y) == 0:
-        return 0.0
-    y = to_float32_wave(y)
-    eps = 1e-9
-    # amplitude threshold from dB
-    thr = 10 ** (SILENCE_DB_THRESHOLD / 20.0)  # convert to linear
-    idx = np.where(np.abs(y) > thr)[0]
-    if len(idx) == 0:
-        return len(y) / sr
-    last = idx[-1]
-    tail = (len(y) - 1 - last) / sr
-    return float(max(0.0, tail))
+    y_t = torch.tensor(y, dtype=torch.float32)
+    y_rs = torchaudio.functional.resample(y_t, sr, TARGET_SR)
+    return y_rs.numpy()
 
 # -----------------------------
-# Load model
+# ASR
 # -----------------------------
 processor = Wav2Vec2Processor.from_pretrained(MODEL_ID)
 model = Wav2Vec2ForCTC.from_pretrained(MODEL_ID)
 model.eval()
 
-@torch.inference_mode()
-def asr_transcribe(y: np.ndarray, sr: int) -> str:
-    y16 = resample_to_target(y, sr)
-    inputs = processor(y16, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
-    logits = model(**inputs).logits
+def run_asr(y: np.ndarray, sr: int) -> str:
+    y = to_float32_audio(y)
+    y = resample_audio(y, sr)
+
+    inputs = processor(y, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
+    with torch.no_grad():
+        logits = model(inputs.input_values).logits
     pred_ids = torch.argmax(logits, dim=-1)
     text = processor.batch_decode(pred_ids)[0]
+    # keep only letters/spaces, lower
+    text = text.strip()
     return text
 
-# -----------------------------
-# Token repair logic (merge/split tolerant)
-# -----------------------------
-def repair_tokens(tokens, expected_proxies):
-    """
-    Attempt to fix common ASR fragmentation:
-    - keep long tokens
-    - for short tokens (< MIN_TOKEN_LEN), try joining with neighbor(s) if it improves match to any expected proxy
-    """
-    if not tokens:
-        return []
-
-    repaired = []
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-
-        # if token is short, try joining with next or prev
-        if len(t) < MIN_TOKEN_LEN:
-            candidates = [t]
-            if repaired:
-                candidates.append(repaired[-1] + t)  # join with prev
-            if i + 1 < len(tokens):
-                candidates.append(t + tokens[i+1])  # join with next
-                if repaired:
-                    candidates.append(repaired[-1] + t + tokens[i+1])  # join prev+short+next
-
-            # score candidates by best similarity to any expected proxy
-            def best_score(x):
-                return max((sim(x, e) for e in expected_proxies), default=0.0)
-
-            best = max(candidates, key=best_score)
-            # If best uses next token (t+next), we consume next
-            used_next = (i + 1 < len(tokens)) and (best.endswith(tokens[i+1])) and (best != t) and (best != (repaired[-1] + t if repaired else ""))
-            used_prev = repaired and (best.startswith(repaired[-1])) and (best != t)
-
-            # apply replacement carefully
-            if used_prev:
-                repaired[-1] = best  # replace prev with merged
-            else:
-                repaired.append(best)
-
-            if used_next and i + 1 < len(tokens):
-                i += 2
-            else:
-                i += 1
-            continue
-
-        # normal token
-        repaired.append(t)
-        i += 1
-
-    # remove duplicates caused by merges (simple)
-    out = []
-    for t in repaired:
-        if not out or out[-1] != t:
-            out.append(t)
-    return out
+def clean_tokens(asr_text: str) -> List[str]:
+    t = asr_text.lower()
+    t = re.sub(r"[^a-z\s~_]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    toks = [x for x in t.split(" ") if x]
+    # remove ultra-short tokens that create false alarms
+    toks = [x for x in toks if len(x) >= MIN_TOKEN_LEN]
+    return toks
 
 # -----------------------------
-# Alignment (simple greedy)
+# Alignment + "silent listener" decision
 # -----------------------------
-def align_expected_to_tokens(expected_words, expected_proxies, tokens):
-    """
-    Greedy matching:
-    for each expected word, pick the best remaining token (in order)
-    """
-    alignment = []
-    used = [False] * len(tokens)
+@dataclass
+class CheckResult:
+    status: str                # "OK", "LOWCONF", "WARN"
+    note: str                  # human-friendly
+    details: str               # optional debug text (limited)
 
-    for ew, ep in zip(expected_words, expected_proxies):
-        best_j = None
-        best_s = 0.0
+def align_expected_to_tokens(expected_words: List[str], tokens: List[str]) -> Tuple[List[Tuple[str, Optional[str], float]], float]:
+    """
+    Greedy alignment: for each expected word proxy, pick best token similarity.
+    Returns per-word alignment list and average similarity.
+    """
+    proxies = [ar_to_proxy(w) for w in expected_words]
+    used = set()
+    aligned = []
+    sims = []
+
+    for w, p in zip(expected_words, proxies):
+        best_j, best_s = None, 0.0
         for j, tok in enumerate(tokens):
-            if used[j]:
+            if j in used:
                 continue
-            s = sim(tok, ep)
+            s = sim(p, tok)
             if s > best_s:
                 best_s = s
                 best_j = j
-        if best_j is None or best_s < SIM_OK:
-            alignment.append((ew, ep, None, 0.0, "MISS"))
+        if best_j is not None and best_s >= LOWCONF_THRESHOLD:
+            used.add(best_j)
+            aligned.append((w, tokens[best_j], best_s))
+            sims.append(best_s)
         else:
-            used[best_j] = True
-            status = "OK" if best_s >= SIM_STRICT else "UNCERTAIN"
-            alignment.append((ew, ep, tokens[best_j], best_s, status))
+            aligned.append((w, None, 0.0))
+            sims.append(0.0)
 
-    extras = [tokens[i] for i, u in enumerate(used) if not u]
-    return alignment, extras
+    avg = float(np.mean(sims)) if sims else 0.0
+    return aligned, avg
 
-def summarize_alignment(alignment):
-    missing = []
-    wrong = []
-    matched_ok = 0
-    for ew, ep, tok, s, status in alignment:
+def decide_silent_listener(expected_words: List[str], tokens: List[str], strike_state: Dict[str, Dict[str, int]], key: str) -> CheckResult:
+    aligned, avg = align_expected_to_tokens(expected_words, tokens)
+
+    missing = [w for (w, tok, s) in aligned if tok is None]
+    weak = [(w, tok, s) for (w, tok, s) in aligned if tok is not None and s < OK_SIM_THRESHOLD]
+
+    # If ASR is too messy, do NOT blame user
+    if avg < LOWCONF_THRESHOLD and len(tokens) <= 3:
+        return CheckResult(
+            status="LOWCONF",
+            note="🟡 Low confidence (ASR noisy). Try again (no judgment).",
+            details=""
+        )
+
+    # Silent OK if nothing missing and weak is small
+    if not missing and len(weak) <= 1:
+        # reset strikes for this key
+        strike_state[key] = {}
+        return CheckResult(
+            status="OK",
+            note="✅ Looks OK (silent listener).",
+            details=""
+        )
+
+    # If missing exists, apply two-strike logic
+    # Only warn if the SAME missing word repeats
+    if missing:
+        first_miss = missing[0]
+        strike_state.setdefault(key, {})
+        strike_state[key][first_miss] = strike_state[key].get(first_miss, 0) + 1
+
+        if strike_state[key][first_miss] >= TWO_STRIKE:
+            return CheckResult(
+                status="WARN",
+                note=f"🛑 Possible skip near: **{first_miss}** (repeated {TWO_STRIKE}x)",
+                details=_format_alignment(aligned)
+            )
+        else:
+            return CheckResult(
+                status="LOWCONF",
+                note=f"🟡 Maybe check: **{first_miss}** (I’ll only stop if it repeats).",
+                details=""
+            )
+
+    # If no missing but many weak, treat as low confidence
+    return CheckResult(
+        status="LOWCONF",
+        note="🟡 I heard it, but confidence is low. Please try once more.",
+        details=""
+    )
+
+def _format_alignment(aligned: List[Tuple[str, Optional[str], float]]) -> str:
+    lines = ["🔍 Per-word (approx):"]
+    for w, tok, s in aligned:
         if tok is None:
-            missing.append(ew)
+            lines.append(f"- {w} -> ❌")
         else:
-            if status == "OK":
-                matched_ok += 1
-            else:
-                # uncertain counts as "possible wrong"
-                wrong.append((ew, tok, s))
-    return matched_ok, missing, wrong
-
-def format_alignment_lines(alignment):
-    lines = []
-    for ew, ep, tok, s, status in alignment:
-        if tok is None:
-            lines.append(f"- {ew}  ->  ❌ (no token aligned)")
-        else:
-            icon = "✅" if status == "OK" else "⚠️"
-            lines.append(f"- {ew}  ->  {icon} {tok}  (sim {s:.2f})")
-    return "\n".join(lines)
+            lines.append(f"- {w} -> {tok} ({s:.2f})")
+    return "\n".join(lines[:MAX_OUTPUT_LINES])
 
 # -----------------------------
-# Training log
+# Gradio App
 # -----------------------------
-def append_log(entry: dict):
-    entry["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+def run_check(ayah_key: str, audio: Tuple[int, np.ndarray], state: dict):
+    if state is None:
+        state = {}
+    strike_state = state.setdefault("strikes", {})
 
-def ensure_log_exists():
-    if not os.path.exists(LOG_PATH):
-        with open(LOG_PATH, "w", encoding="utf-8") as f:
-            pass
-
-def download_log_file():
-    ensure_log_exists()
-    return LOG_PATH
-
-# -----------------------------
-# Main runner
-# -----------------------------
-def run_check(choice, audio):
-    """
-    audio from gr.Audio(type="numpy") returns (sr, np.array)
-    """
-    if audio is None:
-        return "⚠️ Please record audio first.", ""
-
-    surah, ayah = parse_choice(choice)
-    expected = QURAN.get((surah, ayah), "")
-    if not expected:
-        return "⚠️ This ayah is not in the MVP dataset yet.", ""
+    if ayah_key not in QURAN:
+        return "Choose a valid start point.", state
 
     sr, y = audio
-    y = np.array(y)
-    dur = len(y) / float(sr) if sr else 0.0
-    tail = tail_silence_seconds(y, sr)
+    if y is None:
+        return "Please record audio.", state
 
-    # ASR
-    raw = asr_transcribe(y, sr)
+    expected = QURAN[ayah_key]
+    exp_words = arabic_words(expected)
 
-    # Expected words + proxies
-    expected_words = arabic_words_no_diacritics(expected)
-    expected_proxies = [ar_to_proxy(w) for w in expected_words]
+    t0 = time.time()
+    asr_raw = run_asr(y, sr)
+    toks = clean_tokens(asr_raw)
+    dt = time.time() - t0
 
-    # Tokens
-    tokens = tokenize_asr(raw)
-    repaired = repair_tokens(tokens, expected_proxies)
+    result = decide_silent_listener(exp_words, toks, strike_state, ayah_key)
 
-    # Align
-    alignment, extras = align_expected_to_tokens(expected_words, expected_proxies, repaired)
-    matched_ok, missing, wrong = summarize_alignment(alignment)
+    # Output: short + human-like
+    out_lines = []
+    out_lines.append(f"Start: {ayah_key}")
+    out_lines.append(f"Expected: {expected}")
+    out_lines.append("")
+    out_lines.append(f"Duration: {len(y)/sr:.2f}s | SR: {sr}")
+    out_lines.append(f"ASR: {asr_raw}")
+    out_lines.append("")
+    out_lines.append(result.note)
 
-    # "next expected hint" = first missing word, else last word
-    hint = missing[0] if missing else expected_words[-1] if expected_words else ""
+    # only show details when we actually stop (WARN)
+    if result.status == "WARN" and result.details:
+        out_lines.append("")
+        out_lines.append(result.details)
 
-    # stuck detection
-    stuck = tail >= STUCK_TAIL_SECONDS
+    return "\n".join(out_lines), state
 
-    # Build output text
-    out = []
-    out.append(f"✅ Start point: {surah}:{ayah}")
-    out.append(f"Expected (with harakaat): {expected}")
-    out.append(f"Expected words: {expected_words}")
-    out.append(f"Expected proxy: {expected_proxies}")
-    out.append("")
-    out.append(f"🎙️ Duration: {dur:.2f}s | SR: {sr}")
-    out.append(f"📝 ASR Raw: {raw}")
-    out.append(f"🧩 ASR Tokens (cleaned): {repaired}")
-    out.append("")
-    out.append("---")
-    out.append(f"Matched (OK): {matched_ok}/{len(expected_words)} | ASR tokens: {len(repaired)}")
-
-    if missing:
-        out.append(f"❌ Missing word(s): {', '.join(missing)}")
-    if wrong:
-        wtxt = " , ".join([f"{w[0]}⇢{w[1]}({w[2]:.2f})" for w in wrong[:4]])
-        out.append(f"⚠️ Wrong/uncertain word(s): {wtxt}")
-    if extras:
-        out.append(f"⚠️ Extra token(s): {', '.join(extras[:6])}")
-
-    out.append(f"➡️ Next expected word (hint): **{hint}**")
-    out.append("")
-    out.append("🔍 Per-word alignment:")
-    out.append(format_alignment_lines(alignment))
-
-    if stuck:
-        out.append("")
-        out.append(f"🧠 Possible stuck detected (you paused ~{tail:.1f}s at the end).")
-        out.append(f"Hint: next word is **{hint}**")
-
-    out.append("")
-    out.append("Rule: Select ONE ayah and recite ONLY that ayah.")
-    out.append("Next step after this: we’ll keep building your training log (no heavy model training).")
-
-    result_text = "\n".join(out)
-
-    # Save training log
-    entry = {
-        "surah": surah,
-        "ayah": ayah,
-        "expected": expected,
-        "expected_words": expected_words,
-        "expected_proxies": expected_proxies,
-        "asr_raw": raw,
-        "tokens_before": tokens,
-        "tokens_repaired": repaired,
-        "alignment": [
-            {"expected": ew, "proxy": ep, "token": tok, "sim": float(s), "status": st}
-            for (ew, ep, tok, s, st) in alignment
-        ],
-        "missing": missing,
-        "wrong": [{"expected": w0, "token": w1, "sim": float(w2)} for (w0, w1, w2) in wrong],
-        "extras": extras,
-        "duration_sec": float(dur),
-        "sr": int(sr),
-        "tail_silence_sec": float(tail),
-        "stuck": bool(stuck),
-    }
-    append_log(entry)
-
-    # Also return a compact “one-line” for quick copy if you want later
-    compact = f"{surah}:{ayah} | ASR: {raw} | missing: {','.join(missing) if missing else '-'}"
-    return result_text, compact
-
-# -----------------------------
-# UI
-# -----------------------------
-with gr.Blocks(title="Qur’an Recitation Checker (MVP)") as demo:
-    gr.Markdown("## Qur’an Recitation Checker (MVP)\n"
-                "Pick **one ayah**, recite **only that ayah**, then click **Check**.\n\n"
-                "This version saves your attempts to a **training_log.jsonl** file automatically.")
-
+with gr.Blocks() as demo:
+    gr.Markdown("## Qur’an Revision (Silent Listener Mode v1)")
+    gr.Markdown("This is an MVP. It will **stay quiet** unless an issue repeats.")
     with gr.Row():
-        ayah_choice = gr.Dropdown(choices=list_ayat(), value=list_ayat()[0], label="Start point (Surah:Ayah)")
-    audio = gr.Audio(sources=["microphone"], type="numpy", label="Record (mic)")
-
-    with gr.Row():
-        btn = gr.Button("✅ Check Recitation", variant="primary")
-        btn_dl = gr.Button("⬇️ Download Training Log")
-    out_text = gr.Textbox(label="Result", lines=22)
-    compact_text = gr.Textbox(label="Compact (optional)", lines=1)
-
-    with gr.Row():
-        btn_copy = gr.Button("📋 Copy Result")
-        copy_status = gr.Textbox(label="Copy status", lines=1)
-
-    log_file = gr.File(label="training_log.jsonl", visible=True)
-
-    btn.click(fn=run_check, inputs=[ayah_choice, audio], outputs=[out_text, compact_text])
-
-    # Download log
-    btn_dl.click(fn=download_log_file, inputs=None, outputs=log_file)
-
-    # Copy (NO undefined anymore)
-    # We do copy on the client side and return a status string.
-    btn_copy.click(
-        fn=lambda txt: txt,
-        inputs=out_text,
-        outputs=copy_status,
-        js="""
-        (txt) => {
-            try {
-                navigator.clipboard.writeText(txt || "");
-                return "Copied ✅";
-            } catch (e) {
-                return "Copy failed ❌ (browser blocked clipboard)";
-            }
-        }
-        """
-    )
+        ayah = gr.Dropdown(choices=list(QURAN.keys()), value="1:1", label="Start point")
+    audio = gr.Audio(sources=["microphone", "upload"], type="numpy", label="Record / Upload")
+    state = gr.State({})
+    btn = gr.Button("Check recitation")
+    out = gr.Textbox(label="Result", lines=18)
+    btn.click(run_check, inputs=[ayah, audio, state], outputs=[out, state])
 
 demo.queue().launch()
