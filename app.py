@@ -229,7 +229,7 @@ def decide(expected_words: List[str], tokens: List[str], strikes: Dict[str, Dict
 # Logging
 # -----------------------------
 def init_state():
-    return {"strikes": {}, "log": []}
+    return {"strikes": {}, "log": [], "last": None}
 
 def build_log_text(log_rows: List[dict]) -> str:
     if not log_rows:
@@ -252,12 +252,12 @@ def run_check(ayah_key: str, audio: Tuple[int, np.ndarray], state: dict):
         state = init_state()
 
     if ayah_key not in QURAN:
-        return "Choose a valid start point.", "", state
+        return "Choose a valid start point.", "Choose a valid ayah key.", state
+
+    if audio is None or audio[1] is None:
+        return "Please record audio.", "Record audio first.", state
 
     sr, y = audio
-    if y is None:
-        return "Please record audio.", "", state
-
     expected = QURAN[ayah_key]
     exp_words = arabic_words(expected)
 
@@ -277,7 +277,6 @@ def run_check(ayah_key: str, audio: Tuple[int, np.ndarray], state: dict):
         out_lines.append("")
         out_lines.append(result.details)
 
-    # Store last check (for log finalize step)
     state["last"] = {
         "ayah": ayah_key,
         "expected": expected,
@@ -286,7 +285,6 @@ def run_check(ayah_key: str, audio: Tuple[int, np.ndarray], state: dict):
         "app_note": result.note,
     }
 
-    # Return: result text + show "awaiting feedback" hint
     hint = "Now choose your feedback below and click: Save This Attempt."
     return "\n".join(out_lines), hint, state
 
@@ -309,8 +307,6 @@ def save_attempt(user_feedback: str, user_word: str, user_comment: str, state: d
         "user_comment": (user_comment or "").strip(),
     }
     state["log"].append(row)
-
-    # reset last so each check must be saved explicitly
     state["last"] = None
 
     msg = "✅ Saved to log. Do next attempt."
@@ -338,29 +334,28 @@ with gr.Blocks() as demo:
     hint_box = gr.Textbox(label="Next", lines=1)
 
     gr.Markdown("### User Feedback (required for logging)")
-    with gr.Row():
-        feedback = gr.Dropdown(
-            choices=[
-                "✅ I recited correctly",
-                "🧪 I intentionally skipped a word",
-                "🧪 I intentionally said a wrong word",
-                "🤷 Not sure / ASR issue",
-            ],
-            value="✅ I recited correctly",
-            label="What did YOU do?"
-        )
-    with gr.Row():
-        word_box = gr.Textbox(label="Which word? (optional)", placeholder="e.g., الرحمن / رب / العالمين")
+    feedback = gr.Dropdown(
+        choices=[
+            "✅ I recited correctly",
+            "🧪 I intentionally skipped a word",
+            "🧪 I intentionally said a wrong word",
+            "🤷 Not sure / ASR issue",
+        ],
+        value="✅ I recited correctly",
+        label="What did YOU do?"
+    )
+    word_box = gr.Textbox(label="Which word? (optional)", placeholder="e.g., الرحمن / رب / العالمين")
     comment_box = gr.Textbox(label="Extra note (optional)", placeholder="e.g., I paused / I repeated / mic noise", lines=2)
 
     btn_save = gr.Button("Save This Attempt to Log")
     save_msg = gr.Textbox(label="Save status", lines=1)
 
     gr.Markdown("### Session Log")
-    log_box = gr.Textbox(label="Log (copy & paste here)", lines=14)
+    # elem_id makes JS copy stable across gradio versions
+    log_box = gr.Textbox(label="Log (copy & paste here)", lines=14, elem_id="log_box_text")
 
     with gr.Row():
-        btn_copy = gr.Button("Copy Log to Clipboard")
+        btn_copy = gr.Button("Copy Log to Clipboard", elem_id="copy_log_btn")
         btn_clear = gr.Button("Clear Log")
 
     # actions
@@ -368,12 +363,30 @@ with gr.Blocks() as demo:
     btn_save.click(save_attempt, inputs=[feedback, word_box, comment_box, state], outputs=[save_msg, log_box, state])
     btn_clear.click(clear_log, inputs=[state], outputs=[save_msg, log_box, state])
 
-    # Copy via JS
-    btn_copy.click(
-        fn=None,
-        inputs=[log_box],
-        outputs=[],
-        _js="(text)=>{navigator.clipboard.writeText(text || '');}"
-    )
+    # JS copy handler (no gradio js/_js args needed)
+    gr.HTML("""
+    <script>
+      function _copyLogBoxText() {
+        const btn = document.getElementById("copy_log_btn");
+        const log = document.getElementById("log_box_text");
+        if (!btn || !log) return;
+
+        btn.addEventListener("click", async () => {
+          try {
+            // log is a textarea in gradio textbox
+            const text = log.value || "";
+            await navigator.clipboard.writeText(text);
+          } catch (e) {
+            // Fallback for older browsers
+            log.select();
+            document.execCommand("copy");
+          }
+        });
+      }
+
+      // run after gradio mounts
+      setTimeout(_copyLogBoxText, 700);
+    </script>
+    """)
 
 demo.queue().launch()
