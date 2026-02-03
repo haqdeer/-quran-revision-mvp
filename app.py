@@ -15,16 +15,18 @@ from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 MODEL_ID = "elgeish/wav2vec2-large-xlsr-53-arabic"
 TARGET_SR = 16000
 
-# "Silent listener" tuning
-MIN_TOKEN_LEN = 3              # ignore tokens shorter than this (e.g., "al", "r")
-OK_SIM_THRESHOLD = 0.62        # similarity needed to treat a token as "good enough"
-LOWCONF_THRESHOLD = 0.45       # below this = low confidence
-TWO_STRIKE = 2                 # only warn after same issue repeats
-MAX_OUTPUT_LINES = 40          # keep UI clean
+# Matching
+MIN_TOKEN_LEN = 3
+OK_SIM_THRESHOLD = 0.68
+LOWCONF_THRESHOLD = 0.50
+
+# Stop gating (make it RARE)
+STRIKES_TO_STOP = 3
+STOP_MIN_AVG_SIM = 0.60
+STOP_MAX_WORDS = 6   # for longer ayah, never stop (ASR too noisy)
 
 # -----------------------------
-# Quran test set (for now)
-# Extend later using dataset, but MVP = fixed
+# Quran MVP set
 # -----------------------------
 QURAN = {
     "1:1": "بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ",
@@ -34,7 +36,7 @@ QURAN = {
 }
 
 # -----------------------------
-# Helpers: Arabic normalization
+# Arabic normalization
 # -----------------------------
 AR_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
 AR_PUNCT = re.compile(r"[^\u0600-\u06FF\s]")
@@ -53,9 +55,7 @@ def arabic_words(s: str) -> List[str]:
     return [w for w in s.split(" ") if w]
 
 # -----------------------------
-# Proxy: convert Arabic word -> simple latin-ish skeleton
-# NOTE: We do NOT use str.translate with multi-char keys (your earlier crash).
-# We keep it simple and safe.
+# Proxy mapping (single-char safe)
 # -----------------------------
 AR2LAT_SINGLE = {
     "ا":"a","أ":"a","إ":"i","آ":"a","ء":"", "ؤ":"w","ئ":"y",
@@ -73,15 +73,13 @@ def ar_to_proxy(word: str) -> str:
     out = []
     for ch in word:
         out.append(AR2LAT_SINGLE.get(ch, ""))
-    proxy = "".join(out)
-    proxy = proxy.lower()
+    proxy = "".join(out).lower()
     proxy = re.sub(r"[^a-z]+", "", proxy)
-    # remove common leading article "al" noise impact a bit
     proxy = re.sub(r"^al+", "al", proxy)
     return proxy
 
 # -----------------------------
-# Similarity (simple + fast)
+# Similarity (bigrams)
 # -----------------------------
 def bigrams(s: str) -> set:
     if len(s) < 2:
@@ -97,17 +95,15 @@ def sim(a: str, b: str) -> float:
     return len(A & B) / len(A | B)
 
 # -----------------------------
-# Audio processing
+# Audio
 # -----------------------------
 def to_float32_audio(y: np.ndarray) -> np.ndarray:
-    # Gradio often returns int16 from mic
     if y is None:
         return y
     if y.dtype == np.int16:
         y = y.astype(np.float32) / 32768.0
     elif y.dtype != np.float32:
         y = y.astype(np.float32)
-    # mono
     if y.ndim == 2:
         y = np.mean(y, axis=1).astype(np.float32)
     return y
@@ -129,39 +125,33 @@ model.eval()
 def run_asr(y: np.ndarray, sr: int) -> str:
     y = to_float32_audio(y)
     y = resample_audio(y, sr)
-
     inputs = processor(y, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
     with torch.no_grad():
         logits = model(inputs.input_values).logits
     pred_ids = torch.argmax(logits, dim=-1)
     text = processor.batch_decode(pred_ids)[0]
-    # keep only letters/spaces, lower
-    text = text.strip()
-    return text
+    return text.strip()
 
 def clean_tokens(asr_text: str) -> List[str]:
     t = asr_text.lower()
     t = re.sub(r"[^a-z\s~_]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     toks = [x for x in t.split(" ") if x]
-    # remove ultra-short tokens that create false alarms
     toks = [x for x in toks if len(x) >= MIN_TOKEN_LEN]
     return toks
 
 # -----------------------------
-# Alignment + "silent listener" decision
+# Alignment + decision
 # -----------------------------
 @dataclass
 class CheckResult:
-    status: str                # "OK", "LOWCONF", "WARN"
-    note: str                  # human-friendly
-    details: str               # optional debug text (limited)
+    status: str   # OK / LOW / STOP
+    note: str
+    avg_sim: float
+    first_issue: Optional[str]
+    details: str
 
 def align_expected_to_tokens(expected_words: List[str], tokens: List[str]) -> Tuple[List[Tuple[str, Optional[str], float]], float]:
-    """
-    Greedy alignment: for each expected word proxy, pick best token similarity.
-    Returns per-word alignment list and average similarity.
-    """
     proxies = [ar_to_proxy(w) for w in expected_words]
     used = set()
     aligned = []
@@ -174,8 +164,8 @@ def align_expected_to_tokens(expected_words: List[str], tokens: List[str]) -> Tu
                 continue
             s = sim(p, tok)
             if s > best_s:
-                best_s = s
-                best_j = j
+                best_s, best_j = s, j
+
         if best_j is not None and best_s >= LOWCONF_THRESHOLD:
             used.add(best_j)
             aligned.append((w, tokens[best_j], best_s))
@@ -187,117 +177,203 @@ def align_expected_to_tokens(expected_words: List[str], tokens: List[str]) -> Tu
     avg = float(np.mean(sims)) if sims else 0.0
     return aligned, avg
 
-def decide_silent_listener(expected_words: List[str], tokens: List[str], strike_state: Dict[str, Dict[str, int]], key: str) -> CheckResult:
-    aligned, avg = align_expected_to_tokens(expected_words, tokens)
-
-    missing = [w for (w, tok, s) in aligned if tok is None]
-    weak = [(w, tok, s) for (w, tok, s) in aligned if tok is not None and s < OK_SIM_THRESHOLD]
-
-    # If ASR is too messy, do NOT blame user
-    if avg < LOWCONF_THRESHOLD and len(tokens) <= 3:
-        return CheckResult(
-            status="LOWCONF",
-            note="🟡 Low confidence (ASR noisy). Try again (no judgment).",
-            details=""
-        )
-
-    # Silent OK if nothing missing and weak is small
-    if not missing and len(weak) <= 1:
-        # reset strikes for this key
-        strike_state[key] = {}
-        return CheckResult(
-            status="OK",
-            note="✅ Looks OK (silent listener).",
-            details=""
-        )
-
-    # If missing exists, apply two-strike logic
-    # Only warn if the SAME missing word repeats
-    if missing:
-        first_miss = missing[0]
-        strike_state.setdefault(key, {})
-        strike_state[key][first_miss] = strike_state[key].get(first_miss, 0) + 1
-
-        if strike_state[key][first_miss] >= TWO_STRIKE:
-            return CheckResult(
-                status="WARN",
-                note=f"🛑 Possible skip near: **{first_miss}** (repeated {TWO_STRIKE}x)",
-                details=_format_alignment(aligned)
-            )
-        else:
-            return CheckResult(
-                status="LOWCONF",
-                note=f"🟡 Maybe check: **{first_miss}** (I’ll only stop if it repeats).",
-                details=""
-            )
-
-    # If no missing but many weak, treat as low confidence
-    return CheckResult(
-        status="LOWCONF",
-        note="🟡 I heard it, but confidence is low. Please try once more.",
-        details=""
-    )
-
-def _format_alignment(aligned: List[Tuple[str, Optional[str], float]]) -> str:
+def format_alignment(aligned):
     lines = ["🔍 Per-word (approx):"]
     for w, tok, s in aligned:
         if tok is None:
             lines.append(f"- {w} -> ❌")
         else:
             lines.append(f"- {w} -> {tok} ({s:.2f})")
-    return "\n".join(lines[:MAX_OUTPUT_LINES])
+    return "\n".join(lines[:40])
+
+def decide(expected_words: List[str], tokens: List[str], strikes: Dict[str, Dict[str, int]], key: str) -> CheckResult:
+    aligned, avg = align_expected_to_tokens(expected_words, tokens)
+    missing = [w for (w, tok, s) in aligned if tok is None]
+    weak = [(w, tok, s) for (w, tok, s) in aligned if tok is not None and s < OK_SIM_THRESHOLD]
+
+    # For long ayah: never STOP (too many false alarms)
+    if len(expected_words) > STOP_MAX_WORDS:
+        if avg >= OK_SIM_THRESHOLD and not missing:
+            strikes[key] = {}
+            return CheckResult("OK", "✅ Looks OK (quiet).", avg, None, "")
+        return CheckResult("LOW", "🟡 Low confidence for long ayah (ASR noisy). Try again.", avg, None, "")
+
+    # If ASR is too messy, keep quiet and don't blame
+    if avg < LOWCONF_THRESHOLD:
+        return CheckResult("LOW", "🟡 Low confidence (ASR noisy). Try again.", avg, None, "")
+
+    if not missing and len(weak) <= 1:
+        strikes[key] = {}
+        return CheckResult("OK", "✅ Looks OK (quiet).", avg, None, "")
+
+    first_issue = missing[0] if missing else (weak[0][0] if weak else None)
+
+    # Strike tracking
+    if first_issue:
+        strikes.setdefault(key, {})
+        strikes[key][first_issue] = strikes[key].get(first_issue, 0) + 1
+
+        # STOP only if repeated a lot AND avg is high
+        if strikes[key][first_issue] >= STRIKES_TO_STOP and avg >= STOP_MIN_AVG_SIM:
+            return CheckResult(
+                "STOP",
+                f"🛑 Possible mistake near: **{first_issue}** (repeated {STRIKES_TO_STOP}x)",
+                avg,
+                first_issue,
+                format_alignment(aligned)
+            )
+
+    return CheckResult("LOW", "🟡 Not confident enough to stop. Try once more.", avg, first_issue, "")
 
 # -----------------------------
-# Gradio App
+# Logging
+# -----------------------------
+def init_state():
+    return {"strikes": {}, "log": []}
+
+def build_log_text(log_rows: List[dict]) -> str:
+    if not log_rows:
+        return "No logs yet."
+    lines = []
+    lines.append("QURAN REVISION LOG (MVP)")
+    lines.append("-" * 40)
+    for i, r in enumerate(log_rows, 1):
+        lines.append(f"{i}) time={r['ts']} | ayah={r['ayah']} | app={r['app_status']} | note={r['app_note']}")
+        lines.append(f"   asr={r['asr']}")
+        lines.append(f"   user={r['user_feedback']} | word={r['user_word']} | comment={r['user_comment']}")
+        lines.append("-" * 40)
+    return "\n".join(lines)
+
+# -----------------------------
+# Gradio functions
 # -----------------------------
 def run_check(ayah_key: str, audio: Tuple[int, np.ndarray], state: dict):
     if state is None:
-        state = {}
-    strike_state = state.setdefault("strikes", {})
+        state = init_state()
 
     if ayah_key not in QURAN:
-        return "Choose a valid start point.", state
+        return "Choose a valid start point.", "", state
 
     sr, y = audio
     if y is None:
-        return "Please record audio.", state
+        return "Please record audio.", "", state
 
     expected = QURAN[ayah_key]
     exp_words = arabic_words(expected)
 
-    t0 = time.time()
     asr_raw = run_asr(y, sr)
     toks = clean_tokens(asr_raw)
-    dt = time.time() - t0
 
-    result = decide_silent_listener(exp_words, toks, strike_state, ayah_key)
+    result = decide(exp_words, toks, state["strikes"], ayah_key)
 
-    # Output: short + human-like
     out_lines = []
     out_lines.append(f"Start: {ayah_key}")
     out_lines.append(f"Expected: {expected}")
     out_lines.append("")
-    out_lines.append(f"Duration: {len(y)/sr:.2f}s | SR: {sr}")
     out_lines.append(f"ASR: {asr_raw}")
     out_lines.append("")
     out_lines.append(result.note)
-
-    # only show details when we actually stop (WARN)
-    if result.status == "WARN" and result.details:
+    if result.status == "STOP" and result.details:
         out_lines.append("")
         out_lines.append(result.details)
 
-    return "\n".join(out_lines), state
+    # Store last check (for log finalize step)
+    state["last"] = {
+        "ayah": ayah_key,
+        "expected": expected,
+        "asr": asr_raw,
+        "app_status": result.status,
+        "app_note": result.note,
+    }
 
+    # Return: result text + show "awaiting feedback" hint
+    hint = "Now choose your feedback below and click: Save This Attempt."
+    return "\n".join(out_lines), hint, state
+
+def save_attempt(user_feedback: str, user_word: str, user_comment: str, state: dict):
+    if state is None:
+        state = init_state()
+
+    last = state.get("last")
+    if not last:
+        return "No attempt to save yet. First click: Check recitation.", build_log_text(state["log"]), state
+
+    row = {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "ayah": last["ayah"],
+        "asr": last["asr"],
+        "app_status": last["app_status"],
+        "app_note": last["app_note"],
+        "user_feedback": user_feedback or "N/A",
+        "user_word": (user_word or "").strip(),
+        "user_comment": (user_comment or "").strip(),
+    }
+    state["log"].append(row)
+
+    # reset last so each check must be saved explicitly
+    state["last"] = None
+
+    msg = "✅ Saved to log. Do next attempt."
+    return msg, build_log_text(state["log"]), state
+
+def clear_log(state: dict):
+    state = init_state()
+    return "Log cleared.", build_log_text(state["log"]), state
+
+# -----------------------------
+# UI
+# -----------------------------
 with gr.Blocks() as demo:
-    gr.Markdown("## Qur’an Revision (Silent Listener Mode v1)")
-    gr.Markdown("This is an MVP. It will **stay quiet** unless an issue repeats.")
+    gr.Markdown("## Qur’an Revision MVP (Auto Logger + Quiet Mode)")
+    gr.Markdown("This version stays quiet. It only stops on repeated + confident issues, and it auto-builds logs.")
+
+    state = gr.State(init_state())
+
     with gr.Row():
         ayah = gr.Dropdown(choices=list(QURAN.keys()), value="1:1", label="Start point")
     audio = gr.Audio(sources=["microphone", "upload"], type="numpy", label="Record / Upload")
-    state = gr.State({})
-    btn = gr.Button("Check recitation")
-    out = gr.Textbox(label="Result", lines=18)
-    btn.click(run_check, inputs=[ayah, audio, state], outputs=[out, state])
+
+    btn_check = gr.Button("Check recitation")
+    result_box = gr.Textbox(label="Result", lines=14)
+    hint_box = gr.Textbox(label="Next", lines=1)
+
+    gr.Markdown("### User Feedback (required for logging)")
+    with gr.Row():
+        feedback = gr.Dropdown(
+            choices=[
+                "✅ I recited correctly",
+                "🧪 I intentionally skipped a word",
+                "🧪 I intentionally said a wrong word",
+                "🤷 Not sure / ASR issue",
+            ],
+            value="✅ I recited correctly",
+            label="What did YOU do?"
+        )
+    with gr.Row():
+        word_box = gr.Textbox(label="Which word? (optional)", placeholder="e.g., الرحمن / رب / العالمين")
+    comment_box = gr.Textbox(label="Extra note (optional)", placeholder="e.g., I paused / I repeated / mic noise", lines=2)
+
+    btn_save = gr.Button("Save This Attempt to Log")
+    save_msg = gr.Textbox(label="Save status", lines=1)
+
+    gr.Markdown("### Session Log")
+    log_box = gr.Textbox(label="Log (copy & paste here)", lines=14)
+
+    with gr.Row():
+        btn_copy = gr.Button("Copy Log to Clipboard")
+        btn_clear = gr.Button("Clear Log")
+
+    # actions
+    btn_check.click(run_check, inputs=[ayah, audio, state], outputs=[result_box, hint_box, state])
+    btn_save.click(save_attempt, inputs=[feedback, word_box, comment_box, state], outputs=[save_msg, log_box, state])
+    btn_clear.click(clear_log, inputs=[state], outputs=[save_msg, log_box, state])
+
+    # Copy via JS
+    btn_copy.click(
+        fn=None,
+        inputs=[log_box],
+        outputs=[],
+        _js="(text)=>{navigator.clipboard.writeText(text || '');}"
+    )
 
 demo.queue().launch()
